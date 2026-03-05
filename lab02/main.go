@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 )
@@ -22,6 +24,7 @@ type Product struct {
 	ID          int    `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	Icon        string `json:"icon"`
 	Deleted     bool   `json:"-"`
 }
 
@@ -35,8 +38,11 @@ type updateProductRequest struct {
 	Description *string `json:"description"`
 }
 
-var products []Product
-var mu sync.Mutex
+var (
+	products  []Product
+	mu        sync.Mutex
+	imagesDir string = "./product_images"
+)
 
 func createProduct(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
@@ -54,6 +60,7 @@ func createProduct(w http.ResponseWriter, r *http.Request) {
 		ID:          id,
 		Name:        req.Name,
 		Description: req.Description,
+		Icon:        "",
 		Deleted:     false,
 	}
 
@@ -164,11 +171,90 @@ func listProducts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+func uploadProductImage(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("product_id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil || id < 0 {
+		writeError(w, http.StatusBadRequest, "invalid product_id")
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	p, ok := getExistingProduct(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "product not found")
+		return
+	}
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil { // 10MB
+		writeError(w, http.StatusBadRequest, "expected multipart/form-data less than 10 MB")
+		return
+	}
+
+	file, header, err := r.FormFile("icon")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, `file field "icon" is required`)
+		return
+	}
+	defer file.Close()
+
+	if err := os.MkdirAll(imagesDir, 0o755); err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot create images dir")
+		return
+	}
+
+	filename := strconv.Itoa(id) + "_" + filepath.Base(header.Filename)
+	savePath := filepath.Join(imagesDir, filename)
+
+	dst, err := os.Create(savePath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot save file")
+		return
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, file); err != nil {
+		writeError(w, http.StatusInternalServerError, "cannot write file")
+		return
+	}
+
+	p.Icon = savePath
+	writeJSON(w, http.StatusOK, p)
+}
+
+func getProductImage(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("product_id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil || id < 0 {
+		writeError(w, http.StatusBadRequest, "invalid product_id")
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	p, ok := getExistingProduct(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "product not found")
+		return
+	}
+
+	iconPath := p.Icon
+	if iconPath == "" {
+		writeError(w, http.StatusNotFound, "image not uploaded")
+		return
+	}
+
+	http.ServeFile(w, r, iconPath)
+}
+
 func main() {
 	http.HandleFunc("POST /product", createProduct)
 	http.HandleFunc("GET /product/{product_id}", getProduct)
 	http.HandleFunc("PUT /product/{product_id}", updateProduct)
 	http.HandleFunc("DELETE /product/{product_id}", deleteProduct)
 	http.HandleFunc("GET /products", listProducts)
+	http.HandleFunc("POST /product/{product_id}/image", uploadProductImage)
+	http.HandleFunc("GET /product/{product_id}/image", getProductImage)
 	http.ListenAndServe(":8080", nil)
 }
